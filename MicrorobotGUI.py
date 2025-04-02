@@ -20,6 +20,7 @@ RESIZED_HEIGHT = 512
 K = 2.508  # Constant for speed calculation
 horizon = 5  # MPC prediction horizon
 optimization_interval = 1  # Optimization interval in seconds
+TARGET_THRESHOLD = 10  # or any appropriate value in pixels
 
 
 # Global state for mouse interactions and GUI controls
@@ -293,6 +294,14 @@ def get_new_target(previous_target, min_distance=50,
         if distance >= min_distance:
             return (int(new_target_x), int(new_target_y))
 
+# New function to clear all target locations
+def clear_all_targets():
+    global target_locations, completed_targets
+    target_locations = []       # Clear all targets
+    completed_targets = 0       # Reset completed targets counter
+    print("All target locations cleared.")
+
+
 # --------------------------
 # Mouse callback function
 # --------------------------
@@ -450,11 +459,26 @@ def main():
                 target_locations.append(target_location)
                 new_target = None
                 print(f"Target updated via right click: {target_location}")
+                
+
+            # Check if the current target is reached
+            distance_to_target = np.linalg.norm(np.array(current_position) - np.array(target_location))
+            if distance_to_target < TARGET_THRESHOLD:
+                print("Target reached!")
+                completed_targets += 1
+                # If more targets are available, update the current target; otherwise, generate a new one.
+                if completed_targets < len(target_locations):
+                    target_location = target_locations[completed_targets]
+                else:
+                    target_location = get_new_target(current_position)
+                    target_locations.append(target_location)
+                    print(f"New target generated: {target_location}")
             
             # Draw targets and tracking point
             frame_with_tracking = mirrored_frame.copy()
             for idx, t_loc in enumerate(target_locations):
-                color = (0, 255, 0) if idx == completed_targets else (255, 0, 0)
+                # Draw the target in green if reached, blue otherwise
+                color = (0, 255, 0) if idx < completed_targets else (255, 0, 0)
                 cv2.circle(frame_with_tracking, t_loc, 2, color, -1)
             cv2.circle(frame_with_tracking, current_position, 2, (0, 0, 255), -1)
             
@@ -538,8 +562,12 @@ def main():
             cv2.imshow("Camera Feed with Tracking", frame_with_tracking)
             frame_list.append(frame_with_tracking)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('d'):
+                clear_all_targets()  # Press 'd' to clear all target locations
+                
 
             frame_counter += 1
 
