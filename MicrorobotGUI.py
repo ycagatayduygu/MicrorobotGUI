@@ -20,15 +20,13 @@ RESIZED_HEIGHT = 512
 K = 2.508  # Constant for speed calculation
 horizon = 5  # MPC prediction horizon
 optimization_interval = 1  # Optimization interval in seconds
-TARGET_THRESHOLD = 10  # or any appropriate value in pixels
-
+TARGET_THRESHOLD = 10  # threshold in pixels
 
 # Global state for mouse interactions and GUI controls
 new_target = None         # Updated via right-click to set a new target
 new_contour_click = None  # Updated via left-click to reselect the tracked contour
 motion_mode = "surface"   # Default motion mode; will be updated by GUI trackbar
 paused = False            # Pause flag; when True, robot is commanded to stop
-
 
 # Initial target location
 target_location = (300, 300)  # Example target position (x, y)
@@ -38,13 +36,17 @@ last_optimization_time = time.time()
 last_var, last_theta_dot = 0.0, 0.0
 control_data = []  # Array to log control parameters
 
-# Motion mode
-#motion_mode = "surface"  # or "swimming"
-
 # Number of targets to reach
 max_targets = 5
 completed_targets = 0
 target_locations = [target_location]
+
+# Global variables for dynamic bounds and magnitude (default values)
+surface_lower_bound = 0.1
+surface_upper_bound = 2.0
+swimming_lower_bound = 0.1
+swimming_upper_bound = 0.3
+magnitude_value = 10
 
 # Helper function to determine pixel type (mono or color)
 def getPixelType(hCamera):
@@ -85,15 +87,10 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
     """
     Returns four values:
       Wm_opt, delta_opt, theta_dot_opt, error
-
-    In surface mode, delta_opt will be None.
-    In swimming mode, we parse 'delta' from the optimization, and compute Wm from it.
     """
-
     def mpc_cost_function(control_sequence, x, y, theta_degs,
                           target_x, target_y, dt, horizon,
                           last_var, last_theta_dot, motion_mode="surface"):
-
         cost = 0.0
         C1 = 45.39  # For swimming
 
@@ -110,29 +107,20 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
             theta_dot = control_sequence[2*i + 1]
 
             if motion_mode == "surface":
-                # var1 = Wm in [0.1, 1.0]
-                Wm = np.clip(var1, 0.1, 1.0)
-                # Speed
-                K = 2.508
+                # Use dynamic bounds for Wm (var1)
+                Wm = np.clip(var1, surface_lower_bound, surface_upper_bound)
                 V = K * Wm
 
-                # Update heading
                 theta_degs += np.degrees(theta_dot * dt)
                 theta_degs = theta_degs % 360.0
-
-                # Transform to surface coords
                 theta_surf = transform_to_surface_coordinates(theta_degs)
                 theta_rad  = np.radians(theta_surf)
-
-                # Update position
                 x += V * np.sin(theta_rad) * dt
                 y += -V * np.cos(theta_rad) * dt
 
-                # Path cost
                 cost += w_path * ((x - target_x)**2 + (y - target_y)**2)
                 cost += w_Wm_dev * (1.0 - Wm)**2
 
-                # Penalize changes
                 if i == 0:
                     cost += w_change * (Wm - last_var)**2
                     cost += w_tdot  * (theta_dot - last_theta_dot)**2
@@ -143,31 +131,23 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
                     cost += w_change_tdot * (theta_dot - prev_theta_dot)**2
 
             else:
-                # var1 = delta in [0.1, 0.3]
-                delta = np.clip(var1, 0.1, 0.3)
-
-                # We define Wm from delta, or keep Wm constant if you want
-                Wm_ideal = 25.0*delta - 0.67
-                Wm = np.clip(Wm_ideal, (25.0*delta - 1.67), 18.0)
-
-                # Update heading
+                # Use dynamic bounds for delta (var1)
+                delta = np.clip(var1, swimming_lower_bound, swimming_upper_bound)
+                #Wm_ideal = 25.0*delta - 0.67 +8.33
+                Wm_ideal = 14
+                #Wm = np.clip(Wm_ideal, (25.0*delta - 1.67), 18.0)
+                Wm = np.clip(Wm_ideal, 13.00, 15.0)
                 theta_degs += np.degrees(theta_dot * dt)
                 theta_degs = theta_degs % 360.0
-
-                # Swimming transform
                 theta_swim = transform_to_swimming_coordinates(theta_degs)
                 theta_rad  = np.radians(theta_swim)
-
-                # Update position
                 x += C1 * delta * np.cos(theta_rad) * dt
                 y += -C1 * delta * np.sin(theta_rad) * dt
 
-                # Path cost
                 cost += w_path * ((x - target_x)**2 + (y - target_y)**2)
                 cost += w_Wm_dev * (Wm - Wm_ideal)**2
                 cost += 0.5 * ((delta - 0.3)**2)
 
-                # Penalize changes
                 if i == 0:
                     cost += 1.0 * (delta - last_var)**2
                     cost += 0.5 * (theta_dot - last_theta_dot)**2
@@ -179,19 +159,15 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
 
         return cost
 
-    # Unpack
     x, y = current_position
     target_x, target_y = target_position
     dt = optimization_interval
 
-    # Build bounds, initial guess
     if motion_mode == "surface":
-        # Wm in [0.1, 1], theta_dot in [-pi, pi]
-        bounds = [(0.1, 1.0), (-np.pi, np.pi)] * horizon
+        bounds = [(surface_lower_bound, surface_upper_bound), (-np.pi, np.pi)] * horizon
         initial_guess = [last_var, 0.0] * horizon
     else:
-        # delta in [0.1, 0.35], theta_dot in [-pi, np.pi]
-        bounds = [(0.1, 0.3), (-np.pi, np.pi)] * horizon
+        bounds = [(swimming_lower_bound, swimming_upper_bound), (-np.pi, np.pi)] * horizon
         initial_guess = [0.3, 0.0] * horizon
 
     result = minimize(
@@ -204,19 +180,14 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
     )
 
     var1_opt, theta_dot_opt = result.x[0], result.x[1]
-
-    # Compute final cost error
     error = np.sqrt((x - target_x)**2 + (y - target_y)**2)
 
     if motion_mode == "surface":
-        # SURFACE: var1_opt is Wm, delta_opt = None
         Wm_opt = var1_opt
         delta_opt = None
     else:
-        # SWIMMING: var1_opt is delta, derive Wm from delta
         delta_opt = var1_opt
-        Wm_opt = 25.0*delta_opt - 0.67
-        #Wm_opt = np.clip(Wm_opt_ideal, (25.0*delta_opt - 1.67), 18.0)
+        Wm_opt = 25.0*delta_opt - 0.67 + 8.17
 
     return Wm_opt, delta_opt, theta_dot_opt, error
 
@@ -249,7 +220,6 @@ def send_magnetic_field_data(azimuth, inclination, magnitude, rot_inclination, f
         client_socket.sendall(message)
         print(f"Sent: Azimuth={azimuth}, Inclination={inclination}, "
               f"Rot_Inclination={rot_inclination}, Rot_Azimuth={rot_azimuth}")
-
         client_socket.close()
     except Exception as e:
         print(f"Error while sending magnetic field data: {e}")
@@ -258,9 +228,6 @@ def send_magnetic_field_data(azimuth, inclination, magnitude, rot_inclination, f
 
 
 def process_frame(frame):
-    """
-    Processes the frame to detect and find contours of the object to be tracked.
-    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5,5), 0)
     binary = cv2.adaptiveThreshold(
@@ -294,17 +261,12 @@ def get_new_target(previous_target, min_distance=50,
         if distance >= min_distance:
             return (int(new_target_x), int(new_target_y))
 
-# New function to clear all target locations
 def clear_all_targets():
     global target_locations, completed_targets
     target_locations = []       # Clear all targets
     completed_targets = 0       # Reset completed targets counter
     print("All target locations cleared.")
 
-
-# --------------------------
-# Mouse callback function
-# --------------------------
 
 def mouse_callback(event, x, y, flags, param):
     global new_target, new_contour_click
@@ -318,7 +280,6 @@ def mouse_callback(event, x, y, flags, param):
 def main():
     global last_optimization_time, last_var, last_theta_dot, completed_targets
     global target_location, new_target, new_contour_click, motion_mode, paused
-    # Example: define EXIT_FAILURE if you want
     EXIT_FAILURE = 1
 
     ret = PxLApi.initialize(0)
@@ -377,15 +338,23 @@ def main():
         cv2.destroyAllWindows()
 
         current_position = tracked_centroid
-        
-        
+
         # Setup display and control GUI windows
         cv2.namedWindow("Camera Feed with Tracking")
         cv2.setMouseCallback("Camera Feed with Tracking", mouse_callback)
         cv2.namedWindow("Controls")
+        cv2.moveWindow("Camera Feed with Tracking", 100, 100)
+        cv2.moveWindow("Controls", 700, 100)
         cv2.createTrackbar("Motion Mode", "Controls", 0, 1, lambda x: None)  # 0: surface, 1: swimming
         cv2.createTrackbar("Pause", "Controls", 0, 1, lambda x: None)         # 0: run, 1: pause
 
+        # New trackbars for dynamic parameters
+        cv2.createTrackbar("Mag", "Controls", 10, 20, lambda x: None)  # Magnitude (0-20)
+        cv2.createTrackbar("Surface LB", "Controls", 10, 100, lambda x: None)  # Surface lower bound (scale: /100)
+        cv2.createTrackbar("Surface UB", "Controls", 100, 200, lambda x: None) # Surface upper bound (scale: /100)
+        cv2.createTrackbar("Swim LB", "Controls", 10, 35, lambda x: None)      # Swimming lower bound (scale: /100)
+        cv2.createTrackbar("Swim UB", "Controls", 30, 35, lambda x: None)        # Swimming upper bound (scale: /100)
+        cv2.createTrackbar("Opt Interval", "Controls", 10, 50, lambda x: None)  # Interval in tenths of a second
 
         frame_list = []
         location_data = []
@@ -393,6 +362,19 @@ def main():
         frame_counter = 0
 
         while True:
+            # Update dynamic parameters from trackbars each loop iteration
+            surface_lower_bound = cv2.getTrackbarPos("Surface LB", "Controls") / 100.0
+            surface_upper_bound = cv2.getTrackbarPos("Surface UB", "Controls") / 100.0
+            swimming_lower_bound = cv2.getTrackbarPos("Swim LB", "Controls") / 100.0
+            swimming_upper_bound = cv2.getTrackbarPos("Swim UB", "Controls") / 100.0
+            magnitude_value = cv2.getTrackbarPos("Mag", "Controls")
+            optimization_interval = cv2.getTrackbarPos("Opt Interval", "Controls") / 10.0
+            
+            opt_val = cv2.getTrackbarPos("Opt Interval", "Controls")
+            if opt_val == 0:
+                opt_val = 1  # Ensure non-zero value
+            optimization_interval = opt_val / 10.0
+
             ret = PxLApi.getNextFrame(hCamera, rawFrame)
             if not PxLApi.apiSuccess(ret[0]):
                 break
@@ -408,19 +390,15 @@ def main():
 
             # Process frame and get contours
             contours, _ = process_frame(mirrored_frame)
-            # Filter out contours with None centroids
             valid_contours = [cnt for cnt in contours if get_contour_centroid(cnt) is not None]
-            
+
             if new_contour_click is not None:
                 manual_click_point = new_contour_click
-                new_contour_click = None  # Reset after processing
+                new_contour_click = None
                 if valid_contours:
-                    # Find the contour closest to the manual click
                     closest_contour = min(
                         valid_contours,
-                        key=lambda cnt: np.linalg.norm(
-                            np.array(get_contour_centroid(cnt)) - np.array(manual_click_point)
-                        )
+                        key=lambda cnt: np.linalg.norm(np.array(get_contour_centroid(cnt)) - np.array(manual_click_point))
                     )
                     new_tracked_centroid = get_contour_centroid(closest_contour)
                     if new_tracked_centroid is not None:
@@ -432,19 +410,13 @@ def main():
                     print("No valid contours detected for manual update.")
             else:
                 if valid_contours:
-                    # Find the contour closest to the previous centroid
                     closest_contour = min(
                         valid_contours,
-                        key=lambda cnt: np.linalg.norm(
-                            np.array(get_contour_centroid(cnt)) - np.array(previous_centroid)
-                        )
+                        key=lambda cnt: np.linalg.norm(np.array(get_contour_centroid(cnt)) - np.array(previous_centroid))
                     )
                     new_tracked_centroid = get_contour_centroid(closest_contour)
                     if new_tracked_centroid is not None:
-                        # Only update if the movement is reasonable (within 20 pixels)
-                        distance = np.linalg.norm(
-                            np.array(new_tracked_centroid) - np.array(previous_centroid)
-                        )
+                        distance = np.linalg.norm(np.array(new_tracked_centroid) - np.array(previous_centroid))
                         if distance <= 20:
                             tracked_centroid = new_tracked_centroid
                             current_position = tracked_centroid
@@ -452,54 +424,43 @@ def main():
                 else:
                     print("No valid contours detected for automatic update.")
 
-            
-            # Update target if a right-click was detected
             if new_target is not None:
                 target_location = new_target
                 target_locations.append(target_location)
                 new_target = None
                 print(f"Target updated via right click: {target_location}")
-                
 
-            # Check if the current target is reached
             distance_to_target = np.linalg.norm(np.array(current_position) - np.array(target_location))
             if distance_to_target < TARGET_THRESHOLD:
                 print("Target reached!")
                 completed_targets += 1
-                # If more targets are available, update the current target; otherwise, generate a new one.
                 if completed_targets < len(target_locations):
                     target_location = target_locations[completed_targets]
                 else:
                     target_location = get_new_target(current_position)
                     target_locations.append(target_location)
                     print(f"New target generated: {target_location}")
-            
-            # Draw targets and tracking point
+
             frame_with_tracking = mirrored_frame.copy()
             for idx, t_loc in enumerate(target_locations):
-                # Draw the target in green if reached, blue otherwise
                 color = (0, 255, 0) if idx < completed_targets else (255, 0, 0)
                 cv2.circle(frame_with_tracking, t_loc, 2, color, -1)
             cv2.circle(frame_with_tracking, current_position, 2, (0, 0, 255), -1)
-            
-            # Read GUI controls (trackbar positions)
+
             mode_val = cv2.getTrackbarPos("Motion Mode", "Controls")
             pause_val = cv2.getTrackbarPos("Pause", "Controls")
             motion_mode = "surface" if mode_val == 0 else "swimming"
             paused = True if pause_val == 1 else False
-            
-            # Display current mode and pause status on the video frame
+
             cv2.putText(frame_with_tracking, f"Mode: {motion_mode}", (10,20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
             cv2.putText(frame_with_tracking, f"Paused: {paused}", (10,40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-            
 
             current_time = time.time()
 
             if current_time - last_optimization_time >= optimization_interval:
                 if not paused:
-                    # Normal control update using MPC
                     Wm, delta, theta_dot, error = calculate_control_parameters(
                         current_position, target_location, rot_azimuth,
                         last_var, last_theta_dot, motion_mode=motion_mode
@@ -507,13 +468,14 @@ def main():
                     rot_azimuth += np.degrees(theta_dot * optimization_interval)
                     rot_azimuth %= 360
                     freq = Wm
+                    # Use the new magnitude value from the trackbar when not paused
                     if motion_mode == "swimming" and delta is not None:
                         alpha_deg = math.degrees(math.atan(1.0 / delta))
                         inclination = math.radians(90 - alpha_deg)
                         send_magnetic_field_data(
                             azimuth=rot_azimuth,
                             inclination=inclination,
-                            magnitude=10,
+                            magnitude=magnitude_value,
                             rot_inclination=math.radians(90),
                             freq=freq,
                             rot_azimuth=np.radians(rot_azimuth)
@@ -524,7 +486,7 @@ def main():
                         send_magnetic_field_data(
                             azimuth=0,
                             inclination=0,
-                            magnitude=10,
+                            magnitude=magnitude_value,
                             rot_inclination=math.radians(90),
                             freq=freq,
                             rot_azimuth=rot_azimuth_surface_rad
@@ -532,7 +494,7 @@ def main():
                     last_var = delta if motion_mode == "swimming" else Wm
                     last_theta_dot = theta_dot
                 else:
-                    # When paused, send a zero-magnitude command so the robot stops
+                    # When paused, send a zero-magnitude command to stop the robot
                     rot_azimuth_surface = transform_to_surface_coordinates(rot_azimuth)
                     rot_azimuth_surface_rad = np.radians(rot_azimuth_surface)
                     send_magnetic_field_data(
@@ -558,7 +520,6 @@ def main():
                     "paused": paused
                 })
 
-
             cv2.imshow("Camera Feed with Tracking", frame_with_tracking)
             frame_list.append(frame_with_tracking)
 
@@ -566,8 +527,7 @@ def main():
             if key == ord('q'):
                 break
             elif key == ord('d'):
-                clear_all_targets()  # Press 'd' to clear all target locations
-                
+                clear_all_targets()
 
             frame_counter += 1
 
