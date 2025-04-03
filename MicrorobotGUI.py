@@ -27,6 +27,7 @@ new_target = None         # Updated via right-click to set a new target
 new_contour_click = None  # Updated via left-click to reselect the tracked contour
 motion_mode = "surface"   # Default motion mode; will be updated by GUI trackbar
 paused = False            # Pause flag; when True, robot is commanded to stop
+auto_paused = False
 
 # Initial target location
 target_location = (300, 300)  # Example target position (x, y)
@@ -279,7 +280,7 @@ def mouse_callback(event, x, y, flags, param):
 
 def main():
     global last_optimization_time, last_var, last_theta_dot, completed_targets
-    global target_location, new_target, new_contour_click, motion_mode, paused
+    global target_location, new_target, new_contour_click, motion_mode, paused, auto_paused
     EXIT_FAILURE = 1
 
     ret = PxLApi.initialize(0)
@@ -356,6 +357,7 @@ def main():
         cv2.createTrackbar("Swim UB", "Controls", 30, 35, lambda x: None)        # Swimming upper bound (scale: /100)
         cv2.createTrackbar("Opt Interval", "Controls", 10, 50, lambda x: None)  # Interval in tenths of a second
 
+        raw_frame_list = []
         frame_list = []
         location_data = []
         start_time = time.time()
@@ -387,6 +389,7 @@ def main():
             resized_frame = cv2.resize(npFormatedImage, (RESIZED_WIDTH, RESIZED_HEIGHT))
             mirrored_frame = cv2.flip(resized_frame, 0)
 
+            raw_frame_list.append(mirrored_frame.copy())
             # Process frame and get contours
             contours, _ = process_frame(mirrored_frame)
             valid_contours = [cnt for cnt in contours if get_contour_centroid(cnt) is not None]
@@ -426,19 +429,17 @@ def main():
             if new_target is not None:
                 target_location = new_target
                 target_locations.append(target_location)
+                auto_paused = False  # Resume operation when a new target is provided by the user
                 new_target = None
                 print(f"Target updated via right click: {target_location}")
 
             distance_to_target = np.linalg.norm(np.array(current_position) - np.array(target_location))
             if distance_to_target < TARGET_THRESHOLD:
-                print("Target reached!")
-                completed_targets += 1
-                if completed_targets < len(target_locations):
-                    target_location = target_locations[completed_targets]
-                else:
-                    target_location = get_new_target(current_position)
-                    target_locations.append(target_location)
-                    print(f"New target generated: {target_location}")
+                if not auto_paused:  # Only do this once per reached target
+                    print("Target reached! Pausing.")
+                    completed_targets += 1
+                    auto_paused = True
+
 
             frame_with_tracking = mirrored_frame.copy()
             
@@ -448,9 +449,10 @@ def main():
             cv2.circle(frame_with_tracking, current_position, 3, (0, 0, 255), -1)
 
             mode_val = cv2.getTrackbarPos("Motion Mode", "Controls")
-            pause_val = cv2.getTrackbarPos("Pause", "Controls")
+            manual_pause = True if cv2.getTrackbarPos("Pause", "Controls") == 1 else False
             motion_mode = "surface" if mode_val == 0 else "swimming"
-            paused = True if pause_val == 1 else False
+            paused = manual_pause or auto_paused
+
 
             cv2.putText(frame_with_tracking, f"Mode: {motion_mode}", (10,20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
@@ -551,6 +553,16 @@ def main():
         for frame in frame_list:
             video_writer.write(frame)
         video_writer.release()
+
+
+        # Save raw video (without overlays)
+        raw_video_filename = f"camera_feed_{timestamp}_raw.mp4"
+        raw_video_writer = cv2.VideoWriter(raw_video_filename, fourcc, fps,
+                                            (RESIZED_WIDTH, RESIZED_HEIGHT))
+        for frame in raw_frame_list:
+            raw_video_writer.write(frame)
+        raw_video_writer.release()
+
 
         data_filename = f"control_data_{timestamp}.csv"
         import pandas as pd
