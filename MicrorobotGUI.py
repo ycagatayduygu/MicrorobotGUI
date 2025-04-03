@@ -368,7 +368,6 @@ def main():
             swimming_lower_bound = cv2.getTrackbarPos("Swim LB", "Controls") / 100.0
             swimming_upper_bound = cv2.getTrackbarPos("Swim UB", "Controls") / 100.0
             magnitude_value = cv2.getTrackbarPos("Mag", "Controls")
-            optimization_interval = cv2.getTrackbarPos("Opt Interval", "Controls") / 10.0
             
             opt_val = cv2.getTrackbarPos("Opt Interval", "Controls")
             if opt_val == 0:
@@ -442,10 +441,11 @@ def main():
                     print(f"New target generated: {target_location}")
 
             frame_with_tracking = mirrored_frame.copy()
+            
             for idx, t_loc in enumerate(target_locations):
                 color = (0, 255, 0) if idx < completed_targets else (255, 0, 0)
-                cv2.circle(frame_with_tracking, t_loc, 2, color, -1)
-            cv2.circle(frame_with_tracking, current_position, 2, (0, 0, 255), -1)
+                cv2.circle(frame_with_tracking, t_loc, 3, color, -1)
+            cv2.circle(frame_with_tracking, current_position, 3, (0, 0, 255), -1)
 
             mode_val = cv2.getTrackbarPos("Motion Mode", "Controls")
             pause_val = cv2.getTrackbarPos("Pause", "Controls")
@@ -468,17 +468,21 @@ def main():
                     rot_azimuth += np.degrees(theta_dot * optimization_interval)
                     rot_azimuth %= 360
                     freq = Wm
+                    rot_inclination = math.radians(90)
+
                     # Use the new magnitude value from the trackbar when not paused
                     if motion_mode == "swimming" and delta is not None:
                         alpha_deg = math.degrees(math.atan(1.0 / delta))
                         inclination = math.radians(90 - alpha_deg)
+                        # Use transform_to_swimming_coordinates for swimming mode:
+                        rot_swim = transform_to_swimming_coordinates(rot_azimuth)
                         send_magnetic_field_data(
-                            azimuth=rot_azimuth,
+                            azimuth=np.radians(rot_swim),
                             inclination=inclination,
                             magnitude=magnitude_value,
-                            rot_inclination=math.radians(90),
+                            rot_inclination=rot_inclination,  # Sending as radian; see note below
                             freq=freq,
-                            rot_azimuth=np.radians(rot_azimuth)
+                            rot_azimuth=np.radians(rot_swim)
                         )
                     else:
                         rot_azimuth_surface = transform_to_surface_coordinates(rot_azimuth)
@@ -487,7 +491,7 @@ def main():
                             azimuth=0,
                             inclination=0,
                             magnitude=magnitude_value,
-                            rot_inclination=math.radians(90),
+                            rot_inclination=rot_inclination,
                             freq=freq,
                             rot_azimuth=rot_azimuth_surface_rad
                         )
@@ -501,7 +505,7 @@ def main():
                         azimuth=0,
                         inclination=0,
                         magnitude=0,
-                        rot_inclination=math.radians(90),
+                        rot_inclination=0,
                         freq=0,
                         rot_azimuth=rot_azimuth_surface_rad
                     )
@@ -517,7 +521,10 @@ def main():
                     "rot_azimuth_degrees": rot_azimuth,
                     "frequency": freq if not paused else 0,
                     "motion_mode": motion_mode,
-                    "paused": paused
+                    "paused": paused,
+                    "inclination_deg": math.degrees(inclination) if (not paused and motion_mode=="swimming") else 0,
+                    "rot_inclination_deg": math.degrees(rot_inclination) if not paused else 0,
+                    "magnitude": magnitude_value
                 })
 
             cv2.imshow("Camera Feed with Tracking", frame_with_tracking)
