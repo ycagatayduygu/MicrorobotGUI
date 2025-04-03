@@ -141,7 +141,7 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
                 theta_degs = theta_degs % 360.0
                 theta_swim = transform_to_swimming_coordinates(theta_degs)
                 theta_rad  = np.radians(theta_swim)
-                x += C1 * delta * np.cos(theta_rad) * dt
+                x += -C1 * delta * np.cos(theta_rad) * dt
                 y += -C1 * delta * np.sin(theta_rad) * dt
 
                 cost += w_path * ((x - target_x)**2 + (y - target_y)**2)
