@@ -11,8 +11,8 @@ click_point = None
 
 # Parameters for filtering and smoothing the tracked position.
 MIN_CONTOUR_AREA = 18         # Normal mode: keep contours larger than this.
-MAX_JUMP_DISTANCE = 13         # Allowed jump (in pixels) for moderate smoothing.
-PREDICTION_THRESHOLD = 17      # If candidate jump > this, candidate is suspect.
+MAX_JUMP_DISTANCE = 15         # Allowed jump (in pixels) for moderate smoothing.
+PREDICTION_THRESHOLD = 15      # If candidate jump > this, candidate is suspect.
 SMOOTHING_ALPHA = 0.001        # Blending factor when jump is moderate.
 LOST_COUNTER_MAX = 5           # Number of consecutive lost frames allowed before update.
 
@@ -161,7 +161,7 @@ def main():
         if not valid_centroids:
             # Adaptively lower the min area threshold based on lost_counter.
             # The more frames lost, the lower the threshold (but not lower than 10% of MIN_CONTOUR_AREA).
-            adaptive_factor = max(0.1, FALLBACK_AREA_FACTOR - lost_counter * 0.05)
+            adaptive_factor = max(0.1, FALLBACK_AREA_FACTOR - lost_counter * 0.5)
             fallback_min_area = MIN_CONTOUR_AREA * adaptive_factor
             contours_fallback, _ = process_frame(frame, min_area=fallback_min_area)
             valid_centroids = [get_contour_centroid(cnt) for cnt in contours_fallback if get_contour_centroid(cnt) is not None]
