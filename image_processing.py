@@ -10,17 +10,20 @@ import pandas as pd
 click_point = None
 
 # Parameters for filtering and smoothing the tracked position.
-MIN_CONTOUR_AREA = 15          # Keep contours larger than this.
-MAX_JUMP_DISTANCE = 20         # Allowed jump for moderate smoothing.
-PREDICTION_THRESHOLD = 50      # If candidate jump > this, candidate is suspect.
-SMOOTHING_ALPHA = 0.04         # Blending factor when jump is moderate.
+MIN_CONTOUR_AREA = 18         # Normal mode: keep contours larger than this.
+MAX_JUMP_DISTANCE = 13         # Allowed jump (in pixels) for moderate smoothing.
+PREDICTION_THRESHOLD = 17      # If candidate jump > this, candidate is suspect.
+SMOOTHING_ALPHA = 0.001        # Blending factor when jump is moderate.
 LOST_COUNTER_MAX = 5           # Number of consecutive lost frames allowed before update.
 
-def process_frame(frame):
+# Base fallback detection parameter.
+FALLBACK_AREA_FACTOR = 0.3     # Base factor for fallback (effective threshold = MIN_CONTOUR_AREA * factor).
+
+def process_frame(frame, min_area=MIN_CONTOUR_AREA):
     """
     Convert frame to grayscale, blur it, then apply adaptive thresholding
-    and morphological closing to get contours. Only keep contours with area
-    larger than MIN_CONTOUR_AREA.
+    and morphological closing to get contours.
+    Only keep contours with area larger than min_area.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -32,11 +35,14 @@ def process_frame(frame):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > MIN_CONTOUR_AREA]
+    filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_area]
     return filtered_contours, processed
 
 def get_contour_centroid(contour):
-    """Compute the centroid (cx,cy) of a contour."""
+    """
+    Compute the centroid (cx, cy) of a contour.
+    Returns (cx, cy) or None if the area is zero.
+    """
     M = cv2.moments(contour)
     if M["m00"] == 0:
         return None
@@ -45,7 +51,9 @@ def get_contour_centroid(contour):
     return (cx, cy)
 
 def mouse_callback(event, x, y, flags, param):
-    """Record the user's click location."""
+    """
+    Record the user's click location.
+    """
     global click_point
     if event == cv2.EVENT_LBUTTONDOWN:
         click_point = (x, y)
@@ -59,7 +67,11 @@ def main():
         root.withdraw()
         video_file = filedialog.askopenfilename(
             title="Select Video File",
-            filetypes=[("MP4 files", "*.mp4"), ("AVI files", "*.avi"), ("MOV files", "*.mov"), ("MKV files", "*.mkv"), ("All Files", "*.*")]
+            filetypes=[("MP4 files", "*.mp4"), 
+                       ("AVI files", "*.avi"), 
+                       ("MOV files", "*.mov"),
+                       ("MKV files", "*.mkv"), 
+                       ("All Files", "*.*")]
         )
     except Exception as e:
         print("Error using file dialog:", e)
@@ -96,7 +108,6 @@ def main():
         if centroid:
             cv2.putText(display_frame, str(i), centroid, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-    # Let the user choose a contour.
     cv2.namedWindow("Select Contour")
     cv2.setMouseCallback("Select Contour", mouse_callback)
     print("Please click on the contour you want to track. Press ESC to exit if needed.")
@@ -109,7 +120,7 @@ def main():
             return
     cv2.destroyWindow("Select Contour")
 
-    # Find the contour with centroid closest to the clicked point.
+    # Choose the contour whose centroid is closest to the clicked point.
     selected_contour = None
     min_distance = float('inf')
     for cnt in contours:
@@ -128,7 +139,6 @@ def main():
     tracked_centroid = get_contour_centroid(selected_contour)
     print("Selected contour centroid:", tracked_centroid)
 
-    # Setup video writer.
     fps = cap.get(cv2.CAP_PROP_FPS)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out_filename = os.path.splitext(video_file)[0] + "_processed.mp4"
@@ -136,50 +146,59 @@ def main():
 
     location_data = []
     frame_count = 0
-    lost_counter = 0  # Count consecutive frames where candidate is far.
+    lost_counter = 0  # Count consecutive frames where candidate is too far.
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
+        # Process normally.
         contours, _ = process_frame(frame)
         valid_centroids = [get_contour_centroid(cnt) for cnt in contours if get_contour_centroid(cnt) is not None]
 
+        # If no valid candidate from normal settings, try fallback with an adaptive threshold.
+        if not valid_centroids:
+            # Adaptively lower the min area threshold based on lost_counter.
+            # The more frames lost, the lower the threshold (but not lower than 10% of MIN_CONTOUR_AREA).
+            adaptive_factor = max(0.1, FALLBACK_AREA_FACTOR - lost_counter * 0.05)
+            fallback_min_area = MIN_CONTOUR_AREA * adaptive_factor
+            contours_fallback, _ = process_frame(frame, min_area=fallback_min_area)
+            valid_centroids = [get_contour_centroid(cnt) for cnt in contours_fallback if get_contour_centroid(cnt) is not None]
+            if valid_centroids:
+                print(f"Frame {frame_count}: Fallback (adaptive factor {adaptive_factor:.2f}) found {len(valid_centroids)} candidate(s).")
+
         if valid_centroids:
+            # Choose the candidate closest to current tracked position.
             distances = [np.linalg.norm(np.array(pt) - np.array(tracked_centroid)) for pt in valid_centroids]
             min_idx = np.argmin(distances)
             candidate = valid_centroids[min_idx]
             jump_distance = np.linalg.norm(np.array(candidate) - np.array(tracked_centroid))
-            
+
             if jump_distance > PREDICTION_THRESHOLD:
-                # Candidate is far away; increment lost counter.
                 lost_counter += 1
                 print(f"Frame {frame_count}: Candidate jump {jump_distance:.1f} exceeds threshold. Lost counter: {lost_counter}")
                 if lost_counter >= LOST_COUNTER_MAX:
-                    # If persistently lost, update the tracked position.
                     tracked_centroid = candidate
                     lost_counter = 0
                     print(f"Frame {frame_count}: Updating tracked position after {LOST_COUNTER_MAX} lost frames: {tracked_centroid}")
-                # Otherwise, do not update tracked_centroid.
             else:
                 lost_counter = 0  # Reset counter if candidate is acceptable.
                 if jump_distance > MAX_JUMP_DISTANCE:
-                    # Apply smoothing for moderate jumps.
                     tracked_centroid = tuple(np.array(tracked_centroid) + SMOOTHING_ALPHA * (np.array(candidate) - np.array(tracked_centroid)))
                 else:
                     tracked_centroid = candidate
         else:
-            print(f"No valid contours detected in frame {frame_count}; keeping previous position.")
+            print(f"Frame {frame_count}: No valid contours detected; keeping previous position.")
 
         # Draw the tracked centroid.
         if tracked_centroid is not None:
             cv2.circle(frame, (int(tracked_centroid[0]), int(tracked_centroid[1])), 3, (0, 0, 255), -1)
-            
+
         location_data.append({
             "frame": frame_count,
-            "x": tracked_centroid[0] if tracked_centroid is not None else None,
-            "y": tracked_centroid[1] if tracked_centroid is not None else None
+            "x": tracked_centroid[0],
+            "y": tracked_centroid[1]
         })
         out.write(frame)
         frame_count += 1
