@@ -59,6 +59,38 @@ def mouse_callback(event, x, y, flags, param):
         click_point = (x, y)
         print("User clicked at:", click_point)
 
+def estimate_local_blurriness_fft(gray_image, centroid, patch_size=64):
+    """
+    Computes FFT-based sharpness score on a cropped patch around the centroid.
+    Only considers the region around the tracked object rather than the full frame.
+    """
+    x, y = int(centroid[0]), int(centroid[1])
+    half = patch_size // 2
+    h, w = gray_image.shape
+
+    # Clamp coordinates so the patch is fully inside the image.
+    x1, x2 = max(0, x - half), min(w, x + half)
+    y1, y2 = max(0, y - half), min(h, y + half)
+    
+    patch = gray_image[y1:y2, x1:x2]
+    if patch.size == 0 or patch.shape[0] < 10 or patch.shape[1] < 10:
+        return 0.0  # Return zero if the patch is invalid.
+
+    # Compute FFT of the patch and shift the zero frequency component to the center.
+    f = np.fft.fft2(patch)
+    fshift = np.fft.fftshift(f)
+    mag = 20 * np.log(np.abs(fshift) + 1e-8)  # Magnitude spectrum
+
+    ch, cw = patch.shape
+    # Mask the low-frequency center region.
+    mask = np.ones((ch, cw), dtype=bool)
+    center = 5
+    mask[ch//2 - center:ch//2 + center, cw//2 - center:cw//2 + center] = False
+
+    # Mean value of the high-frequency components is our sharpness (blurriness) score.
+    score = np.mean(mag[mask])
+    return score
+
 def main():
     global click_point
 
@@ -153,14 +185,15 @@ def main():
         if not ret:
             break
 
-        # Process normally.
+        # Convert frame to grayscale once for blurriness analysis.
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Process frame normally to get contours.
         contours, _ = process_frame(frame)
         valid_centroids = [get_contour_centroid(cnt) for cnt in contours if get_contour_centroid(cnt) is not None]
 
-        # If no valid candidate from normal settings, try fallback with an adaptive threshold.
+        # If no valid candidate, try fallback with an adaptive threshold.
         if not valid_centroids:
-            # Adaptively lower the min area threshold based on lost_counter.
-            # The more frames lost, the lower the threshold (but not lower than 10% of MIN_CONTOUR_AREA).
             adaptive_factor = max(0.1, FALLBACK_AREA_FACTOR - lost_counter * 0.5)
             fallback_min_area = MIN_CONTOUR_AREA * adaptive_factor
             contours_fallback, _ = process_frame(frame, min_area=fallback_min_area)
@@ -169,7 +202,7 @@ def main():
                 print(f"Frame {frame_count}: Fallback (adaptive factor {adaptive_factor:.2f}) found {len(valid_centroids)} candidate(s).")
 
         if valid_centroids:
-            # Choose the candidate closest to current tracked position.
+            # Choose candidate closest to current tracked position.
             distances = [np.linalg.norm(np.array(pt) - np.array(tracked_centroid)) for pt in valid_centroids]
             min_idx = np.argmin(distances)
             candidate = valid_centroids[min_idx]
@@ -191,14 +224,23 @@ def main():
         else:
             print(f"Frame {frame_count}: No valid contours detected; keeping previous position.")
 
+        # Compute the local blurriness score using the patch around the tracked centroid.
+        blur_score = estimate_local_blurriness_fft(gray_frame, tracked_centroid)
+
         # Draw the tracked centroid.
         if tracked_centroid is not None:
             cv2.circle(frame, (int(tracked_centroid[0]), int(tracked_centroid[1])), 3, (0, 0, 255), -1)
 
+        # Overlay the blurriness score on the frame.
+        cv2.putText(frame, f"Blur: {blur_score:.2f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        # Log location and blurriness data.
         location_data.append({
             "frame": frame_count,
             "x": tracked_centroid[0],
-            "y": tracked_centroid[1]
+            "y": tracked_centroid[1],
+            "blur_score": blur_score
         })
         out.write(frame)
         frame_count += 1
