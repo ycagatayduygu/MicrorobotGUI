@@ -21,7 +21,7 @@ RESIZED_WIDTH = 512
 RESIZED_HEIGHT = 512
 
 #ADJUST BEFORE RUNNING!
-FRAME_RATE = 20
+FRAME_RATE = 8.5
 
 # Control parameters
 K = 2.508  # Constant for speed calculation
@@ -313,7 +313,7 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
     x, y = current_position
     target_x, target_y = target_position
     dt = optimization_interval
-    gamma_dot_max = np.radians(30) / dt
+    gamma_dot_max = np.radians(45) / dt
 
     if motion_mode == "surface":
         bounds        = [(surface_lower_bound, surface_upper_bound),
@@ -473,13 +473,16 @@ def mouse_callback(event, x, y, flags, param):
         print(f"Manual contour selection at: {new_contour_click}")
 
 def main():
-    global last_optimization_time, last_var, last_theta_dot, last_gamma, completed_targets, last_z
+    global last_optimization_time, last_var, last_theta_dot, last_gamma, completed_targets, last_z, desired_sharpness
     global target_location, new_target, new_contour_click, motion_mode, paused, auto_paused
     global surface_lower_bound, surface_upper_bound, swimming_lower_bound, swimming_upper_bound, magnitude_value, optimization_interval
     global last_blur, last_blur_slope, last_optimization_blur, last_gamma_dot
 
     EXIT_FAILURE = 1
 
+    video_writer = None
+    raw_video_writer = None
+    
     ret = PxLApi.initialize(0)
     if not PxLApi.apiSuccess(ret[0]):
         print(f"Error: Unable to initialize a camera! rc = {ret[0]}")
@@ -788,7 +791,7 @@ def main():
                     # increment
                     gamma = (last_gamma + np.degrees(gamma_dot * optimization_interval))
                     # now clamp into [0,30]
-                    gamma = min(max(gamma, 0.0), 30.0)
+                    gamma = min(max(gamma, 30.0), 45.0)
                     last_gamma = gamma
 
                     
@@ -910,8 +913,15 @@ def main():
         PxLApi.uninitialize(hCamera)
         cv2.destroyAllWindows()
         # close the on‑the‑fly video writers
-        video_writer.release()
-        raw_video_writer.release()
+        #video_writer.release()
+        #raw_video_writer.release()
+        
+        # close the on-the-fly video writers if they were created
+        if video_writer is not None and video_writer.isOpened():
+           video_writer.release()
+        if raw_video_writer is not None and raw_video_writer.isOpened():
+           raw_video_writer.release()
+
 
 if __name__ == "__main__":
     main()
