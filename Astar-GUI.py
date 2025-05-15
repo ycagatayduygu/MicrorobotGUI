@@ -41,6 +41,14 @@ desired_sharpness    = 112
 V_TERM_EXPERIMENT = 5.0   # ← replace 5.0 with your measured vertical-lift term
 blur_hist = deque(maxlen=5)
 
+# Path Planning Mode constants
+PATH_PLANNING_ASTAR = "A*"
+PATH_PLANNING_MPC = "MPC-Direct"
+path_planning_mode = PATH_PLANNING_ASTAR  # Default mode
+
+# MPC Obstacle Avoidance Parameters
+OBSTACLE_SAFE_DISTANCE = 20  # Default safe distance for MPC obstacle avoidance
+w_obstacle = 10.0  # Default weight for obstacle avoidance in MPC cost function
 
 # Global state for mouse interactions and GUI controls
 new_target = None         # Updated via right-click to set a new target
@@ -77,25 +85,77 @@ swimming_lower_bound = 0.1
 swimming_upper_bound = 0.3
 magnitude_value = 10
 
+# Waypoint tracking
+last_waypoint_time = 0
+WAYPOINT_PAUSE_DURATION = 0.5
+full_path = None  # Store the complete path for visualization
+
 # -------- A* Planning Setup --------
 np.random.seed(42)
 N_OBS, R_MIN, R_MAX = 8, 25, 60
 BUFFER_PX = 7
-# Generate static obstacle map at 512×512
-obs_map = np.zeros((RESIZED_HEIGHT, RESIZED_WIDTH), dtype=bool)
-obstacles = []
-YY, XX = np.ogrid[:RESIZED_HEIGHT, :RESIZED_WIDTH]
-for _ in range(N_OBS):
-    cx = np.random.randint(60, RESIZED_WIDTH-60)
-    cy = np.random.randint(60, RESIZED_HEIGHT-60)
-    r  = np.random.randint(R_MIN, R_MAX)
-    mask = (XX - cx)**2 + (YY - cy)**2 <= r**2
-    obs_map[mask] = True
-    obstacles.append((cx, cy, r))
 
-# Inflate for safety buffer
-occ_buffer = binary_dilation(obs_map, iterations=BUFFER_PX)
-dist_to_obs = distance_transform_edt(~obs_map)
+# Global variables for obstacle generation
+obstacles = []
+obs_map = None
+occ_buffer = None
+dist_to_obs = None
+selected_contour = None  # Added for click-to-select functionality
+
+def generate_obstacles(current_position=None, min_distance=70):
+    """Generate obstacles, avoiding the current robot position if provided"""
+    global obstacles, obs_map, occ_buffer, dist_to_obs, N_OBS, R_MIN, R_MAX
+    
+    # Generate static obstacle map at 512×512
+    obs_map = np.zeros((RESIZED_HEIGHT, RESIZED_WIDTH), dtype=bool)
+    obstacles = []
+    YY, XX = np.ogrid[:RESIZED_HEIGHT, :RESIZED_WIDTH]
+    
+    for _ in range(N_OBS):
+        cx = np.random.randint(60, RESIZED_WIDTH-60)
+        cy = np.random.randint(60, RESIZED_HEIGHT-60)
+        r  = np.random.randint(R_MIN, R_MAX)
+        
+        # Skip this obstacle if it's too close to the robot
+        if current_position:
+            distance_to_robot = np.hypot(cx - current_position[0], cy - current_position[1])
+            if distance_to_robot < (r + min_distance):
+                continue
+                
+        mask = (XX - cx)**2 + (YY - cy)**2 <= r**2
+        obs_map[mask] = True
+        obstacles.append((cx, cy, r))
+
+    # Inflate for safety buffer
+    occ_buffer = binary_dilation(obs_map, iterations=BUFFER_PX)
+    dist_to_obs = distance_transform_edt(~obs_map)
+    
+    print(f"Generated {len(obstacles)} obstacles, avoiding current position")
+
+def initial_selection_callback(event, x, y, flags, param):
+    global selected_contour, current_position
+    contours, frame = param
+    
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if contours:
+            # Find closest contour centroid to click point
+            valid_centroids = [get_contour_centroid(cnt) for cnt in contours if get_contour_centroid(cnt) is not None]
+            if valid_centroids:
+                closest_idx = min(range(len(valid_centroids)), 
+                                key=lambda i: np.hypot(valid_centroids[i][0] - x, valid_centroids[i][1] - y))
+                
+                # Get the corresponding contour
+                selected_contour = contours[closest_idx]
+                current_position = valid_centroids[closest_idx]
+                print(f"Selected contour {closest_idx} at {current_position}")
+                
+                # Highlight the selected contour and redraw
+                highlight_frame = frame.copy()
+                cv2.drawContours(highlight_frame, [selected_contour], -1, (0, 255, 255), 2)
+                cv2.circle(highlight_frame, current_position, 5, (255, 0, 255), -1)
+                cv2.putText(highlight_frame, f"Selected contour {closest_idx}!", current_position,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                cv2.imshow("First Frame - Select Contour", highlight_frame)
 
 def heuristic(a, b):
     return np.hypot(a[0] - b[0], a[1] - b[1])
@@ -181,7 +241,7 @@ def getPixelType(hCamera):
 
 def calculate_control_parameters(current_position, target_position, rot_azimuth,
                                  last_var, last_theta_dot, last_gamma, last_gamma_dot, last_z, optimization_interval,
-                                 motion_mode="surface"):
+                                 motion_mode="surface", planning_mode=PATH_PLANNING_ASTAR, dist_map=None):
     """
     Returns six values:
       Wm_opt, delta_opt, theta_dot_opt, gamma_dot_opt, error, cost_terms
@@ -198,14 +258,15 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
     
     def mpc_cost_and_breakdown(control_sequence, x, y, theta_degs, z, gamma_degs,
                           target_x, target_y, dt, horizon,
-                          last_var, last_theta_dot, last_gamma_dot, motion_mode="surface"):
+                          last_var, last_theta_dot, last_gamma_dot, motion_mode="surface",
+                          planning_mode_internal=PATH_PLANNING_ASTAR, dist_map_internal=None):
         cost = 0.0
         C1 = 45.39  # For swimming
         C_blur = 45.39        # ← put your own calibration here
 
         target_z = desired_sharpness        
         # initialize per-term accumulators
-        path_cost = dev_cost = smooth_cost = tdot_cost = z_cost = gdot_cost = 0.0
+        path_cost = dev_cost = smooth_cost = tdot_cost = z_cost = gdot_cost = obs_cost = 0.0
         
         # Example weighting factors
         w_path   = 1.0
@@ -216,6 +277,7 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
         w_change_tdot = 5.0
         w_z = 1.0 
         w_change_gammadot = 3.0    # choose as you like
+        # w_obstacle defined globally for tuning via trackbar later
         
         ### ADD
         def signed_blur_error(b , slope , gdot):
@@ -242,6 +304,18 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
                 theta_rad  = np.radians(theta_surf)
                 x += V * np.sin(theta_rad) * dt
                 y += -V * np.cos(theta_rad) * dt
+
+                # Add obstacle avoidance cost for MPC direct planning
+                if planning_mode_internal == PATH_PLANNING_MPC and dist_map_internal is not None:
+                    # Get integer coordinates for checking distance map
+                    pred_x, pred_y = int(np.clip(x, 0, dist_map_internal.shape[1]-1)), int(np.clip(y, 0, dist_map_internal.shape[0]-1))
+                    # Get distance to nearest obstacle
+                    dist_to_obstacle = dist_map_internal[pred_y, pred_x]
+                    # Penalty increases as robot gets closer to obstacles
+                    if dist_to_obstacle < OBSTACLE_SAFE_DISTANCE:
+                        obstacle_penalty = (OBSTACLE_SAFE_DISTANCE - dist_to_obstacle)**2
+                        cost += w_obstacle * obstacle_penalty
+                        obs_cost += w_obstacle * obstacle_penalty
 
                 term = (x - target_x)**2 + (y - target_y)**2
                 cost += w_path * term
@@ -307,6 +381,18 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
                 y += C1 * delta * np.sin(theta_rad) * dt
                 z += (C_blur * delta * np.sin(gamma_rad) - v_term) * dt
                 
+                # Add obstacle avoidance cost for MPC direct planning (swimming mode)
+                if planning_mode_internal == PATH_PLANNING_MPC and dist_map_internal is not None:
+                    # Get integer coordinates for checking distance map
+                    pred_x, pred_y = int(np.clip(x, 0, dist_map_internal.shape[1]-1)), int(np.clip(y, 0, dist_map_internal.shape[0]-1))
+                    # Get distance to nearest obstacle
+                    dist_to_obstacle = dist_map_internal[pred_y, pred_x]
+                    # Penalty increases as robot gets closer to obstacles
+                    if dist_to_obstacle < OBSTACLE_SAFE_DISTANCE:
+                        obstacle_penalty = (OBSTACLE_SAFE_DISTANCE - dist_to_obstacle)**2
+                        cost += w_obstacle * obstacle_penalty
+                        obs_cost += w_obstacle * obstacle_penalty
+                
                 #cost updates with saving parts
                 #path error
                 term = (x - target_x)**2 + (y - target_y)**2
@@ -369,8 +455,8 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
             "smooth": smooth_cost,
             "tdot":   tdot_cost,
             "z":      z_cost,
-            "gdot":  gdot_cost,
-            
+            "gdot":   gdot_cost,
+            "obs":    obs_cost
         }
         return cost, breakdown        
 
@@ -403,7 +489,8 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
         initial_guess,
         args=(x, y, theta_degs, last_z, last_gamma,
               target_x, target_y, dt, horizon,
-              last_var, last_theta_dot, last_gamma_dot, motion_mode),
+              last_var, last_theta_dot, last_gamma_dot, motion_mode,
+              planning_mode, dist_map),
         bounds=bounds,
         method='SLSQP'
     )
@@ -428,8 +515,9 @@ def calculate_control_parameters(current_position, target_position, rot_azimuth,
         x, y, theta_degs,               # state
         last_z, last_gamma,  # z, γ, γ̇
         target_x, target_y, dt, horizon,  # target & timing
-        last_var, last_theta_dot,last_gamma_dot,         # history
-        motion_mode                        # mode
+        last_var, last_theta_dot, last_gamma_dot,         # history
+        motion_mode,                      # mode
+        planning_mode, dist_map           # planning mode & obstacle map
     )
  
 
@@ -548,6 +636,8 @@ def main():
     global target_location, new_target, new_contour_click, motion_mode, paused, auto_paused, target_locations
     global surface_lower_bound, surface_upper_bound, swimming_lower_bound, swimming_upper_bound, magnitude_value, optimization_interval
     global last_blur, last_blur_slope, last_optimization_blur, last_gamma_dot
+    global last_waypoint_time, WAYPOINT_PAUSE_DURATION, full_path, path_planning_mode, OBSTACLE_SAFE_DISTANCE, w_obstacle
+    global current_position, selected_contour
 
     # A* state
     astar_active = False
@@ -596,20 +686,109 @@ def main():
         mirrored_frame = cv2.flip(resized_frame, 0)
 
         contours, _ = process_frame(mirrored_frame)
+        selection_frame = mirrored_frame.copy()
         for i, cnt in enumerate(contours):
-            cv2.drawContours(mirrored_frame, [cnt], -1, (0, 255, 0), 2)
+            cv2.drawContours(selection_frame, [cnt], -1, (0, 255, 0), 2)
             centroid = get_contour_centroid(cnt)
-            print(f"Contour {i}: centroid = {centroid}")
             if centroid:
-                cv2.putText(mirrored_frame, str(i), centroid,
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                cv2.putText(selection_frame, str(i), centroid,
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
 
-        cv2.imshow("First Frame - Select Contour", mirrored_frame)
-        cv2.waitKey(0)
-        contour_index = int(input("Enter the number of the contour you want to track: "))
-        selected_contour = contours[contour_index]
-        current_position  = get_contour_centroid(selected_contour)
+        # Setup for click-to-select functionality
+        cv2.namedWindow("First Frame - Select Contour")
+        cv2.setMouseCallback("First Frame - Select Contour", initial_selection_callback, (contours, selection_frame))
+        
+        # Add instructions for both selection methods
+        instruction_frame = selection_frame.copy()
+        cv2.putText(instruction_frame, "OPTION 1: Click on a contour to select it", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(instruction_frame, "OPTION 2: Press any key and type the contour number", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(instruction_frame, "Press 'q' to quit", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        for i, cnt in enumerate(contours):
+            centroid = get_contour_centroid(cnt)
+            if centroid:
+                # Print contour numbers for reference
+                print(f"Contour {i}: centroid = {centroid}")
+        
+        # Wait for user to either click or press a key
+        current_position = None
+        cv2.imshow("First Frame - Select Contour", instruction_frame)
+        
+        while current_position is None:
+            key = cv2.waitKey(100)
+            
+            # If a key is pressed (except q), switch to manual number entry
+            if key > 0 and key != ord('q'):
+                cv2.setMouseCallback("First Frame - Select Contour", lambda *args: None)  # Disable mouse callback
+                
+                # Keep window open but show "waiting for input" message
+                input_message = instruction_frame.copy()
+                cv2.putText(input_message, "Enter contour number in terminal...", (150, 250),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.imshow("First Frame - Select Contour", input_message)
+                cv2.waitKey(1)  # Brief update to show message
+                
+                try:
+                    contour_index = int(input("Enter the number of the contour you want to track: "))
+                    if 0 <= contour_index < len(contours):
+                        selected_contour = contours[contour_index]
+                        temp_position = get_contour_centroid(selected_contour)
+                        
+                        if temp_position is not None:
+                            current_position = temp_position
+                            print(f"Selected contour {contour_index} via manual entry at {current_position}")
+                            
+                            # Show confirmation
+                            confirm_frame = instruction_frame.copy()
+                            cv2.drawContours(confirm_frame, [selected_contour], -1, (0, 255, 255), 2)
+                            cv2.circle(confirm_frame, current_position, 5, (255, 0, 255), -1)
+                            cv2.putText(confirm_frame, f"Selected contour {contour_index}!", current_position,
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                            cv2.imshow("First Frame - Select Contour", confirm_frame)
+                            cv2.waitKey(1)  # Update display
+                        else:
+                            print(f"Error: Contour {contour_index} has no valid centroid. Please select another.")
+                            cv2.imshow("First Frame - Select Contour", instruction_frame)
+                            cv2.waitKey(1)  # Refresh display
+                    else:
+                        print(f"Error: Invalid contour index. Please enter a number between 0 and {len(contours)-1}.")
+                        cv2.imshow("First Frame - Select Contour", instruction_frame)
+                        cv2.waitKey(1)  # Refresh display
+                except ValueError:
+                    print("Error: Please enter a valid integer for the contour number.")
+                    cv2.imshow("First Frame - Select Contour", instruction_frame)
+                    cv2.waitKey(1)  # Refresh display
+            
+            # If user clicked (callback set current_position), break the loop
+            if current_position is not None:
+                break
+                
+            # Allow quitting
+            if key == ord('q'):
+                return
+
+        cv2.waitKey(500)  # Brief pause to show selection
+        
+        # Now generate obstacles AFTER contour selection
+        cv2.putText(selection_frame, "Press 'g' to generate obstacles", (50, 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.imshow("First Frame - Select Contour", selection_frame)
+        
+        # Wait for 'g' key to generate obstacles
+        waiting_for_obstacles = True
+        while waiting_for_obstacles:
+            key = cv2.waitKey(100)
+            if key == ord('g'):
+                generate_obstacles(current_position)
+                waiting_for_obstacles = False
+            elif key == ord('q'):
+                return
+        
         cv2.destroyAllWindows()
+        
         # Setup display and control GUI windows
         cv2.namedWindow("Camera Feed with Tracking")
         cv2.setMouseCallback("Camera Feed with Tracking", mouse_callback)
@@ -618,6 +797,9 @@ def main():
         cv2.moveWindow("Controls", 700, 100)
         cv2.createTrackbar("Motion Mode", "Controls", 0, 1, lambda x: None)  # 0: surface, 1: swimming
         cv2.createTrackbar("Pause", "Controls", 0, 1, lambda x: None)         # 0: run, 1: pause
+        cv2.createTrackbar("Planning Mode", "Controls", 0, 1, lambda x: None) # 0: A*, 1: MPC-Direct
+        cv2.createTrackbar("Obstacle Distance", "Controls", OBSTACLE_SAFE_DISTANCE, 40, lambda x: None) # Safe distance
+        cv2.createTrackbar("Obstacle Weight", "Controls", int(w_obstacle), 50, lambda x: None) # Weight for obstacle avoidance
 
         # New trackbars for dynamic parameters
         cv2.createTrackbar("Mag", "Controls", 10, 20, lambda x: None)  # Magnitude (0-20)
@@ -660,6 +842,23 @@ def main():
             opt_val = cv2.getTrackbarPos("Opt Interval", "Controls")
             desired_sharpness = cv2.getTrackbarPos("Target Z", "Controls")
             
+            # Read planning mode from trackbar
+            planning_val = cv2.getTrackbarPos("Planning Mode", "Controls")
+            current_planning_mode = PATH_PLANNING_ASTAR if planning_val == 0 else PATH_PLANNING_MPC
+            
+            # Check if planning mode changed
+            if current_planning_mode != path_planning_mode:
+                print(f"Switching planning mode: {path_planning_mode} -> {current_planning_mode}")
+                path_planning_mode = current_planning_mode
+                # Reset path planning state
+                astar_active = False
+                full_path = None
+                
+            # Update obstacle safe distance
+            OBSTACLE_SAFE_DISTANCE = cv2.getTrackbarPos("Obstacle Distance", "Controls")
+            
+            # Update obstacle avoidance weight
+            w_obstacle = float(cv2.getTrackbarPos("Obstacle Weight", "Controls"))
             
             if opt_val == 0:
                 opt_val = 1  # Ensure non-zero value
@@ -800,53 +999,100 @@ def main():
 
 
             if new_target is not None:
+                # Clear previous waypoints when setting a new target
+                target_locations = []
+                completed_targets = 0
+                astar_active = False
+                full_path = None
+
                 if current_position is not None:
-                    start = (current_position[1], current_position[0])
-                    goal = (new_target[1], new_target[0])
-                    path = astar(start, goal, occ_buffer, dist_to_obs, buf=BUFFER_PX)
-                    if path:
-                        raw_wpts = extract_waypoints(path)
-                        astar_waypoints = [(col, row) for (row, col) in raw_wpts]
-                        target_locations = list(astar_waypoints)
-                        completed_targets = 0
-                        astar_active = True
-                        auto_paused = False
-                        print(f"A* planned {len(astar_waypoints)} waypoints")
-                    else:
-                        print("A* planning failed: no path")
+                    # Check if target is inside an obstacle
+                    target_in_obstacle = False
+                    for cx, cy, r in obstacles:
+                        if np.hypot(new_target[0] - cx, new_target[1] - cy) <= r + BUFFER_PX:
+                            target_in_obstacle = True
+                            print("Warning: Target point is inside or too close to an obstacle. Please select a different target.")
+                            auto_paused = True
+                            break
+                    
+                    if not target_in_obstacle:
+                        if path_planning_mode == PATH_PLANNING_ASTAR:
+                            # A* planning mode
+                            start = (current_position[1], current_position[0])
+                            goal = (new_target[1], new_target[0])
+                            path = astar(start, goal, occ_buffer, dist_to_obs, buf=BUFFER_PX)
+                            if path:
+                                full_path = path  # Store the complete path
+                                raw_wpts = extract_waypoints(path)
+                                astar_waypoints = [(col, row) for (row, col) in raw_wpts]
+                                target_locations = list(astar_waypoints)
+                                completed_targets = 0
+                                astar_active = True
+                                auto_paused = False
+                                last_waypoint_time = time.time()
+                                print(f"A* planned {len(astar_waypoints)} waypoints")
+                            else:
+                                print("A* planning failed: no valid path to target. Please select a different target.")
+                                auto_paused = True
+                        else:
+                            # MPC Direct planning mode - set target directly
+                            target_location = new_target
+                            target_locations = [target_location]  # Single target for MPC
+                            print(f"MPC Direct target set to {target_location}")
+                            auto_paused = False
                 new_target = None
 
-            if astar_active:
+            if path_planning_mode == PATH_PLANNING_ASTAR and astar_active:
                 curr_wp = target_locations[completed_targets]
                 distance_to_target = np.linalg.norm(np.array(current_position) - np.array(curr_wp))
+                current_time = time.time()
+                
                 if distance_to_target < TARGET_THRESHOLD:
                     if completed_targets < len(target_locations) - 1:
-                        completed_targets += 1
-                        print(f"Waypoint {completed_targets} reached, moving to next")
+                        if current_time - last_waypoint_time >= WAYPOINT_PAUSE_DURATION:
+                            completed_targets += 1
+                            print(f"Waypoint {completed_targets} reached, moving to next")
+                            last_waypoint_time = current_time
+                        else:
+                            auto_paused = True  # Pause briefly at waypoint
                     else:
                         print("Final goal reached! Pausing.")
                         auto_paused = True
                         astar_active = False
-            else:
-                distance_to_target = np.linalg.norm(np.array(current_position) - np.array(target_location))
+                else:
+                    # If we're moving between waypoints, ensure we're not paused
+                    if current_time - last_waypoint_time >= WAYPOINT_PAUSE_DURATION:
+                        auto_paused = False
+            elif path_planning_mode == PATH_PLANNING_MPC and target_locations:
+                # For MPC direct, check if we've reached the target
+                current_target = target_locations[0]  # Only one target in MPC mode
+                distance_to_target = np.linalg.norm(np.array(current_position) - np.array(current_target))
                 if distance_to_target < TARGET_THRESHOLD:
                     if not auto_paused:
-                        print("Target reached! Pausing.")
-                        completed_targets += 1
+                        print("MPC Direct target reached! Pausing.")
                         auto_paused = True
-
 
             frame_with_tracking = mirrored_frame.copy()
             
-            # ---------- draw static obstacles and clearance ----------
+            # Draw obstacles first
             for cx, cy, r in obstacles:
                 cv2.circle(frame_with_tracking, (cx, cy), r, (0,0,255), 2)
                 cv2.circle(frame_with_tracking, (cx, cy), r + BUFFER_PX, (255,0,0), 1)
 
-            for idx, t_loc in enumerate(target_locations):
-                color = (0, 255, 0) if idx < completed_targets else (255, 0, 0)
-                cv2.circle(frame_with_tracking, t_loc, 3, color, -1)
-            cv2.circle(frame_with_tracking, current_position, 3, (0, 0, 255), -1)
+            # Draw path and waypoints based on planning mode
+            if path_planning_mode == PATH_PLANNING_ASTAR:
+                if astar_active or target_locations:
+                    draw_path_and_waypoints(frame_with_tracking, full_path, target_locations, completed_targets)
+            else:  # MPC Direct mode
+                if target_locations:
+                    # Just show the target
+                    cv2.circle(frame_with_tracking, target_locations[0], 5, (0, 255, 255), -1)
+                    cv2.putText(frame_with_tracking, "MPC Target", 
+                               (target_locations[0][0]+10, target_locations[0][1]),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            # Draw current position
+            cv2.circle(frame_with_tracking, current_position, 3, (255, 255, 0), -1)
 
             mode_val = cv2.getTrackbarPos("Motion Mode", "Controls")
             manual_pause = True if cv2.getTrackbarPos("Pause", "Controls") == 1 else False
@@ -862,20 +1108,31 @@ def main():
                         f"Blur: {blur_score:.1f} / {desired_sharpness}",
                         (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+            cv2.putText(frame_with_tracking, f"Planning: {path_planning_mode}", (10,80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
 
             current_time = time.time()
 
             if current_time - last_optimization_time >= optimization_interval:
                 if not paused:
-                    # ↑ …and ADD this corrected call ↑
-                    goal_for_control = target_locations[completed_targets] if astar_active else target_location
+                    # Determine goal based on planning mode
+                    if path_planning_mode == PATH_PLANNING_ASTAR and astar_active and target_locations:
+                        goal_for_control = target_locations[completed_targets]
+                    else:  # MPC Direct or no active A* path
+                        if target_locations:
+                            goal_for_control = target_locations[0]  # Use the direct target
+                        else:
+                            goal_for_control = target_location
+                    
                     out = calculate_control_parameters(
                         current_position, goal_for_control, rot_azimuth,
                         last_var, last_theta_dot, last_gamma, last_gamma_dot, last_z, optimization_interval,
-                        motion_mode=motion_mode
+                        motion_mode=motion_mode,
+                        planning_mode=path_planning_mode,
+                        dist_map=dist_to_obs
                     )
-                                        # convergence check
+                    # convergence check
                     if out is None:
                         print("MPC failed to converge this cycle, skipping control update")
                         continue
@@ -951,7 +1208,7 @@ def main():
                     error     = None  
                     gamma = last_gamma
                     # define cost_terms so data logging won't error when paused
-                    cost_terms = {"path":0, "dev":0, "smooth":0, "tdot":0, "z":0, "gdot":0}
+                    cost_terms = {"path":0, "dev":0, "smooth":0, "tdot":0, "z":0, "gdot":0, "obs":0}
                 
                 last_optimization_time = current_time
                 delta_safe = delta if ('delta' in locals() and not paused) else 0
@@ -970,17 +1227,20 @@ def main():
                     "paused": paused,
                     "inclination_deg": math.degrees(inclination) if (not paused and motion_mode=="swimming") else 0,
                     "rot_inclination_deg": math.degrees(rot_inclination) if not paused else 0,
-                    "gamma_dot_deg": gamma_dot,
+                    "gamma_dot_deg": math.degrees(gamma_dot) if not paused else 0,
                     "gamma_deg":     gamma,
                     "blur_score": blur_score,           # raw FFT-based blur
                     "smoothed_blur": last_z,            # low-pass filtered blur
                     "magnitude": magnitude_value,
-                    "cost_path":   cost_terms["path"],
-                    "cost_dev":    cost_terms["dev"],
-                    "cost_smooth": cost_terms["smooth"],
-                    "cost_tdot":   cost_terms["tdot"],
-                    "cost_z":      cost_terms["z"],
-                    "cost_gdot":    cost_terms["gdot"]
+                    "planning_mode": path_planning_mode,
+                    "obstacle_distance": OBSTACLE_SAFE_DISTANCE,
+                    "cost_path":   cost_terms.get("path", 0),
+                    "cost_dev":    cost_terms.get("dev", 0),
+                    "cost_smooth": cost_terms.get("smooth", 0),
+                    "cost_tdot":   cost_terms.get("tdot", 0),
+                    "cost_z":      cost_terms.get("z", 0),
+                    "cost_gdot":   cost_terms.get("gdot", 0),
+                    "cost_obs":    cost_terms.get("obs", 0)
                 })
 
             cv2.imshow("Camera Feed with Tracking", frame_with_tracking)
@@ -1026,6 +1286,30 @@ def main():
            video_writer.release()
         if raw_video_writer is not None and raw_video_writer.isOpened():
            raw_video_writer.release()
+
+
+def draw_path_and_waypoints(frame, path, waypoints, completed_targets):
+    """Draw the full path and color-coded waypoints"""
+    # Draw full path if available
+    if path:
+        for i in range(len(path) - 1):
+            pt1 = (path[i][1], path[i][0])  # Convert back from (row,col) to (x,y)
+            pt2 = (path[i+1][1], path[i+1][0])
+            cv2.line(frame, pt1, pt2, (128, 128, 255), 1)  # Light red line for path
+    
+    # Draw waypoints with color indicating progress
+    for idx, t_loc in enumerate(waypoints):
+        if idx < completed_targets:
+            color = (0, 255, 0)  # Green for completed
+        elif idx == completed_targets:
+            color = (0, 255, 255)  # Yellow for current target
+        else:
+            color = (0, 0, 255)  # Red for upcoming
+        cv2.circle(frame, t_loc, 3, color, -1)
+        # Draw waypoint number
+        cv2.putText(frame, str(idx+1), 
+                   (t_loc[0]+10, t_loc[1]+10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
 
 if __name__ == "__main__":
